@@ -45,7 +45,7 @@ struct DonatePromptView: View {
                 .font(.title2.weight(.semibold))
                 .multilineTextAlignment(.center)
 
-            Text(tr("BetterCast is free, has no ads, and does not track you. If it saved you the price of a second monitor, a coffee goes a long way."))
+            Text(tr("BetterCast is free and has no ads. If it saved you the price of a second monitor, a coffee goes a long way."))
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

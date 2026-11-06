@@ -123,6 +123,15 @@ BetterCast is free and open source. If you find it useful and want to support de
 
 **[Donate on Whop](https://whop.com/bettercast/bettercast-donate/)**
 
+## Usage counts (publik build)
+
+This fork is the publik build of BetterCast. It is not the build of the author. See [PUBLIK-BUILD.md](PUBLIK-BUILD.md).
+
+- The Mac app of this build sends two usage events to publik: `app_opened` (one for each launch) and `active_session` (every 30 minutes while the app runs).
+- Each event holds the app name, the app version, the operating system, the CPU type and a random install ID. It holds nothing else: no screen content, no sound, no device names, no network names.
+- To turn it off, set `DO_NOT_TRACK=1` in the environment of the app (for example `launchctl setenv DO_NOT_TRACK 1`, then start the app again), or put `{"usage": false}` in `~/Library/Application Support/publik/consent.json`.
+- Details: https://publikhq.com/skills/telemetry.md
+
 ## Disclaimer
 
 **USE AT YOUR OWN RISK.**

@@ -244,7 +244,7 @@
 
 /* Donation prompt */
 "Want me to keep building free stuff?" = "Soll ich weiter kostenlose Software bauen?";
-"BetterCast is free, has no ads, and does not track you. If it saved you the price of a second monitor, a coffee goes a long way." = "BetterCast ist kostenlos, werbefrei und trackt dich nicht. Wenn es dir einen zweiten Monitor erspart hat, hilft ein Kaffee schon sehr.";
+"BetterCast is free and has no ads. If it saved you the price of a second monitor, a coffee goes a long way." = "BetterCast ist kostenlos und werbefrei. Wenn es dir einen zweiten Monitor erspart hat, hilft ein Kaffee schon sehr.";
 "Buy me a coffee" = "Spendier mir einen Kaffee";
 "Maybe later" = "Vielleicht später";
 "I already donated — stop asking" = "Ich habe bereits gespendet — nicht mehr fragen";

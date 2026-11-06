@@ -23,6 +23,10 @@ struct BetterCastSenderApp: App {
 
     init() {
         _showDonatePrompt = State(initialValue: DonatePromptState.shouldPresentOnLaunch())
+        // publik build: usage counts (app opened, active session). No content is sent.
+        // DO_NOT_TRACK=1 turns it off. See PUBLIK-BUILD.md.
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        PublikTelemetry.start(appSlug: "bettercast", appVersion: version)
     }
 
     var body: some Scene {

@@ -244,7 +244,7 @@
 
 /* Donation prompt */
 "Want me to keep building free stuff?" = "Want me to keep building free stuff?";
-"BetterCast is free, has no ads, and does not track you. If it saved you the price of a second monitor, a coffee goes a long way." = "BetterCast is free, has no ads, and does not track you. If it saved you the price of a second monitor, a coffee goes a long way.";
+"BetterCast is free and has no ads. If it saved you the price of a second monitor, a coffee goes a long way." = "BetterCast is free and has no ads. If it saved you the price of a second monitor, a coffee goes a long way.";
 "Buy me a coffee" = "Buy me a coffee";
 "Maybe later" = "Maybe later";
 "I already donated — stop asking" = "I already donated — stop asking";

@@ -1,0 +1,215 @@
+name: publik build
+
+# publik fork (see PUBLIK-BUILD.md). Compiles the Mac app with usage telemetry v1.
+# It does not sign, it does not notarize and it does not publish. The app is signed and
+# notarized later on a Mac that holds the publik Developer ID. Tags do not start this workflow.
+
+on:
+  push:
+    branches:
+      - 'telemetry/**'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'macOS runner label'
+        required: false
+        default: 'xcode-27'
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: publik-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS universal app (unsigned)
+    # Upstream v24 was built with an Xcode 27 toolchain (Apple ld 27036.1, see make_app.sh).
+    runs-on: ${{ inputs.runner || 'xcode-27' }}
+    timeout-minutes: 45
+    env:
+      UPSTREAM_LD: '27036.1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select the toolchain
+        run: |
+          set -uo pipefail
+          sw_vers
+          PICK=""
+          for x in /Applications/Xcode*.app; do
+            [ -L "$x" ] && continue
+            ld="$x/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld"
+            v="$("$ld" -version_details 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
+            echo "$x: ld $v ($("$ld" -v 2>&1 | head -1))"
+            case "$v" in
+              "$UPSTREAM_LD"|"$UPSTREAM_LD".*) [ -z "$PICK" ] && PICK="$x" ;;
+            esac
+          done
+          if [ -n "$PICK" ]; then
+            sudo xcode-select -s "$PICK/Contents/Developer"
+            echo "Selected $PICK: the same linker as upstream v24."
+          else
+            echo "No Xcode with ld $UPSTREAM_LD on this image. The default Xcode is used."
+          fi
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+
+      - name: Build (universal, same command as make_app.sh)
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Assemble BetterCast.app (same layout as make_app.sh, no signing)
+        run: |
+          set -euo pipefail
+          if [ -f ".build/apple/Products/Release/BetterCastSender" ]; then
+            BUILD_DIR=".build/apple/Products/Release"
+          elif [ -f ".build/out/Products/Release/BetterCastSender" ]; then
+            BUILD_DIR=".build/out/Products/Release"
+          else
+            echo "error: could not find the built BetterCastSender binary under .build/" >&2
+            exit 1
+          fi
+          echo "BUILD_DIR=$BUILD_DIR"
+          APP_NAME="BetterCast.app"
+          rm -rf "$APP_NAME"
+          mkdir -p "$APP_NAME/Contents/MacOS" "$APP_NAME/Contents/Resources" "$APP_NAME/Contents/Frameworks"
+          cp "$BUILD_DIR/BetterCastSender" "$APP_NAME/Contents/MacOS/BetterCastSender"
+          cp "BetterCastSender-Info.plist" "$APP_NAME/Contents/Info.plist"
+          cp "assets/branding/BetterCastIcon.icns" "$APP_NAME/Contents/Resources/AppIcon.icns"
+          if [ ! -d "$BUILD_DIR/Sparkle.framework" ]; then
+            echo "error: Sparkle.framework missing from $BUILD_DIR" >&2
+            exit 1
+          fi
+          cp -R "$BUILD_DIR/Sparkle.framework" "$APP_NAME/Contents/Frameworks/"
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP_NAME/Contents/MacOS/BetterCastSender"
+          for lproj in localization/*.lproj; do
+            cp -R "$lproj" "$APP_NAME/Contents/Resources/"
+          done
+
+      - name: Build facts
+        run: |
+          set -uo pipefail
+          BIN="BetterCast.app/Contents/MacOS/BetterCastSender"
+          echo "architectures: $(lipo -archs "$BIN")"
+          for a in arm64 x86_64; do
+            echo "--- $a LC_BUILD_VERSION (upstream v24: minos 13.0, sdk 13.0, ld $UPSTREAM_LD)"
+            otool -arch "$a" -l "$BIN" | grep -A8 LC_BUILD_VERSION | grep -E "minos|sdk|version"
+          done
+          echo "version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' BetterCast.app/Contents/Info.plist) build $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' BetterCast.app/Contents/Info.plist)"
+          echo "bundle id: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' BetterCast.app/Contents/Info.plist)"
+          otool -L "$BIN" | grep -i sparkle
+          echo "Sparkle: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' BetterCast.app/Contents/Frameworks/Sparkle.framework/Versions/B/Resources/Info.plist)"
+          echo "telemetry endpoint strings in the binary: $(strings -a "$BIN" | grep -c 'publikhq.com/api/v1/telemetry')"
+          find BetterCast.app -type f | wc -l
+
+      - name: Runner test (app_opened reaches a local listener)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          W="$RUNNER_TEMP/smoke"; mkdir -p "$W/out"
+          # Test an ad hoc signed copy. The artifact stays as built.
+          ditto BetterCast.app "$W/BetterCast.app"
+          codesign --force --deep -s - "$W/BetterCast.app" >/dev/null 2>&1 || true
+          cat > "$W/listener.py" <<'PY'
+          import http.server, json, sys
+          out = sys.argv[1]
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('Content-Length') or 0)
+                  body = self.rfile.read(n).decode('utf-8', 'replace')
+                  heads = {k.lower() for k in self.headers.keys()}
+                  with open(out, 'a') as f:
+                      f.write(json.dumps({'path': self.path, 'content_type': self.headers.get('Content-Type'),
+                                          'has_authorization': 'authorization' in heads, 'has_origin': 'origin' in heads,
+                                          'body': body}) + '\n')
+                  self.send_response(204)
+                  self.end_headers()
+              def log_message(self, *a):
+                  pass
+          s = http.server.HTTPServer(('127.0.0.1', 0), H)
+          print(s.server_address[1], flush=True)
+          s.serve_forever()
+          PY
+          run_case() { # name, arch flag, extra env assignment
+            local name="$1" archflag="$2" extra="$3"
+            : > "$W/out/$name.jsonl"
+            python3 "$W/listener.py" "$W/out/$name.jsonl" > "$W/port.txt" 2>/dev/null &
+            local lpid=$!
+            for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$W/port.txt" ] && break; sleep 0.5; done
+            local port; port="$(head -1 "$W/port.txt")"
+            local home="$W/home-$name"; mkdir -p "$home"
+            env HOME="$home" CFFIXED_USER_HOME="$home" $extra \
+              PUBLIK_TELEMETRY_URL="http://127.0.0.1:$port/api/v1/telemetry" PUBLIK_TELEMETRY_DEBUG=1 \
+              arch "$archflag" "$W/BetterCast.app/Contents/MacOS/BetterCastSender" -SUEnableAutomaticChecks NO \
+              > "$W/out/$name.stdout.txt" 2> "$W/out/$name.stderr.txt" &
+            local apid=$!
+            sleep 12
+            if kill -0 "$apid" 2>/dev/null; then echo "$name: process is up after 12 s"; echo up > "$W/out/$name.state"; else echo "$name: process ended early"; echo ended > "$W/out/$name.state"; fi
+            kill "$apid" 2>/dev/null; sleep 1; kill -9 "$apid" 2>/dev/null
+            kill "$lpid" 2>/dev/null
+            : > "$W/port.txt"
+            grep -h "publik-telemetry" "$W/out/$name.stderr.txt" || true
+            echo "$name: requests = $(grep -c . "$W/out/$name.jsonl")"
+            [ -f "$home/Library/Application Support/publik/telemetry.json" ] && echo yes > "$W/out/$name.idfile" || echo no > "$W/out/$name.idfile"
+          }
+          run_case arm64 -arm64 "PUBLIK_TELEMETRY_SMOKE=1"
+          run_case optout -arm64 "DO_NOT_TRACK=1"
+          run_case x86_64 -x86_64 "PUBLIK_TELEMETRY_SMOKE=1"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' BetterCast.app/Contents/Info.plist)"
+          python3 - "$W/out" "$VERSION" <<'PY'
+          import json, re, sys
+          out, version = sys.argv[1], sys.argv[2]
+          def rows(name):
+              return [json.loads(l) for l in open(f'{out}/{name}.jsonl') if l.strip()]
+          def state(name, ext):
+              return open(f'{out}/{name}.{ext}').read().strip()
+          ok = True
+          def check(label, cond):
+              global ok
+              print(('PASS  ' if cond else 'FAIL  ') + label)
+              ok = ok and cond
+          for name, arch in (('arm64', 'arm64'), ('x86_64', 'x64')):
+              r = rows(name)
+              check(f'{name}: process stayed up', state(name, 'state') == 'up')
+              check(f'{name}: exactly one request', len(r) == 1)
+              if len(r) == 1:
+                  b = json.loads(r[0]['body'])
+                  print('      body:', json.dumps(b, sort_keys=True))
+                  check(f'{name}: path', r[0]['path'] == '/api/v1/telemetry')
+                  check(f'{name}: fields', set(b) == {'v', 'app', 'install_id', 'event', 'app_version', 'os', 'arch'})
+                  check(f'{name}: values', b.get('v') == 1 and b.get('app') == 'bettercast' and b.get('event') == 'app_opened'
+                        and b.get('app_version') == version and b.get('os') == 'macos' and b.get('arch') == arch)
+                  check(f'{name}: install_id is a UUID v4', bool(re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', b.get('install_id', ''))))
+                  check(f'{name}: no Origin, no Authorization', not r[0]['has_origin'] and not r[0]['has_authorization'])
+          check('optout: process stayed up', state('optout', 'state') == 'up')
+          check('optout: no request', len(rows('optout')) == 0)
+          check('optout: no telemetry.json', state('optout', 'idfile') == 'no')
+          print('RUNNER TEST: ' + ('PASS' if ok else 'FAIL'))
+          json.dump({'result': 'PASS' if ok else 'FAIL', 'version': version,
+                     'arm64': rows('arm64'), 'x86_64': rows('x86_64'), 'optout': rows('optout')},
+                    open(f'{out}/runner-telemetry.json', 'w'), indent=1)
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Pack the app (ditto keeps the symlinks)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ditto -c -k --keepParent BetterCast.app dist/BetterCast-unsigned.app.zip
+          cp "$RUNNER_TEMP/smoke/out/runner-telemetry.json" dist/ 2>/dev/null || echo '{"result":"NOT RUN"}' > dist/runner-telemetry.json
+          shasum -a 256 dist/BetterCast-unsigned.app.zip
+          ls -la dist
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetterCast-macos-universal-unsigned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

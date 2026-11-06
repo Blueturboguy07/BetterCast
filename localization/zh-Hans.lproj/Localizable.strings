@@ -243,7 +243,7 @@
 
 /* Donation prompt */
 "Want me to keep building free stuff?" = "想让我继续做免费的东西吗？";
-"BetterCast is free, has no ads, and does not track you. If it saved you the price of a second monitor, a coffee goes a long way." = "BetterCast 完全免费，没有广告，也不会追踪你。如果它帮你省下了一台显示器的钱，请我喝杯咖啡就很有帮助。";
+"BetterCast is free and has no ads. If it saved you the price of a second monitor, a coffee goes a long way." = "BetterCast 完全免费，没有广告。如果它帮你省下了一台显示器的钱，请我喝杯咖啡就很有帮助。";
 "Buy me a coffee" = "请我喝杯咖啡";
 "Maybe later" = "以后再说";
 "I already donated — stop asking" = "我已经赞助过了，不用再提醒";
