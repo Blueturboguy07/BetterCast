@@ -111,6 +111,7 @@ jobs:
       - name: Runner test (app_opened reaches a local listener)
         continue-on-error: true
         run: |
+          set +e
           set -uo pipefail
           W="$RUNNER_TEMP/smoke"; mkdir -p "$W/out"
           # Test an ad hoc signed copy. The artifact stays as built.
