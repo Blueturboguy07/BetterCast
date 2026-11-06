@@ -118,44 +118,55 @@ jobs:
           ditto BetterCast.app "$W/BetterCast.app"
           codesign --force --deep -s - "$W/BetterCast.app" >/dev/null 2>&1 || true
           cat > "$W/listener.py" <<'PY'
-          import http.server, json, sys
+          import http.server, json, socketserver, sys, urllib.parse
           out = sys.argv[1]
+          class Server(http.server.HTTPServer):
+              def server_bind(self):  # no reverse lookup of the host name: it can take many seconds
+                  socketserver.TCPServer.server_bind(self)
+                  self.server_name, self.server_port = self.server_address[:2]
           class H(http.server.BaseHTTPRequestHandler):
               def do_POST(self):
                   n = int(self.headers.get('Content-Length') or 0)
                   body = self.rfile.read(n).decode('utf-8', 'replace')
+                  url = urllib.parse.urlsplit(self.path)
+                  case = (urllib.parse.parse_qs(url.query).get('case') or ['none'])[0]
+                  case = ''.join(c for c in case if c.isalnum() or c == '_') or 'none'
                   heads = {k.lower() for k in self.headers.keys()}
-                  with open(out, 'a') as f:
-                      f.write(json.dumps({'path': self.path, 'content_type': self.headers.get('Content-Type'),
+                  with open(f'{out}/{case}.jsonl', 'a') as f:
+                      f.write(json.dumps({'path': url.path, 'content_type': self.headers.get('Content-Type'),
                                           'has_authorization': 'authorization' in heads, 'has_origin': 'origin' in heads,
                                           'body': body}) + '\n')
                   self.send_response(204)
                   self.end_headers()
               def log_message(self, *a):
                   pass
-          s = http.server.HTTPServer(('127.0.0.1', 0), H)
+          s = Server(('127.0.0.1', 0), H)
           print(s.server_address[1], flush=True)
           s.serve_forever()
           PY
+          # One listener for all cases, on a port that the system selects.
+          python3 "$W/listener.py" "$W/out" > "$W/port.txt" 2> "$W/listener.err" &
+          LPID=$!
+          for _ in $(seq 1 120); do [ -s "$W/port.txt" ] && break; sleep 0.5; done
+          PORT="$(head -1 "$W/port.txt")"
+          echo "listener port: '$PORT'"
           run_case() { # name, arch flag, extra env assignment, seconds
             local name="$1" archflag="$2" extra="$3" secs="$4"
             : > "$W/out/$name.jsonl"
-            python3 "$W/listener.py" "$W/out/$name.jsonl" > "$W/port.txt" 2>/dev/null &
-            local lpid=$!
-            for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$W/port.txt" ] && break; sleep 0.5; done
-            local port; port="$(head -1 "$W/port.txt")"
-            echo "$name: listener port '$port', probe from this architecture: HTTP $(arch "$archflag" /usr/bin/curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port/probe")"
+            local probe; probe="$(arch "$archflag" /usr/bin/curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$PORT/probe")"
+            echo "$probe" > "$W/out/$name.probe"
+            echo "$name: probe from this architecture: HTTP $probe (501 = the listener answers)"
             local home="$W/home-$name"; mkdir -p "$home"
             env HOME="$home" CFFIXED_USER_HOME="$home" $extra \
-              PUBLIK_TELEMETRY_URL="http://127.0.0.1:$port/api/v1/telemetry" PUBLIK_TELEMETRY_DEBUG=1 \
+              PUBLIK_TELEMETRY_URL="http://127.0.0.1:$PORT/api/v1/telemetry?case=$name" PUBLIK_TELEMETRY_DEBUG=1 \
               arch "$archflag" "$W/BetterCast.app/Contents/MacOS/BetterCastSender" -SUEnableAutomaticChecks NO \
               > "$W/out/$name.stdout.txt" 2> "$W/out/$name.stderr.txt" &
             local apid=$!
             sleep "$secs"
             if kill -0 "$apid" 2>/dev/null; then echo "$name: process is up after $secs s"; echo up > "$W/out/$name.state"; else echo "$name: process ended early"; echo ended > "$W/out/$name.state"; fi
-            { kill "$apid"; sleep 1; kill -9 "$apid"; wait "$apid"; kill "$lpid"; wait "$lpid"; } 2>/dev/null
-            : > "$W/port.txt"
-            grep -h "publik-telemetry" "$W/out/$name.stderr.txt" || true
+            { kill "$apid"; sleep 1; kill -9 "$apid"; wait "$apid"; } 2>/dev/null
+            grep -h "publik-telemetry" "$W/out/$name.stderr.txt" > "$W/out/$name.debug"
+            cat "$W/out/$name.debug"
             echo "$name: requests = $(grep -c . "$W/out/$name.jsonl")"
             [ -f "$home/Library/Application Support/publik/telemetry.json" ] && echo yes > "$W/out/$name.idfile" || echo no > "$W/out/$name.idfile"
           }
@@ -163,6 +174,7 @@ jobs:
           run_case optout -arm64 "DO_NOT_TRACK=1" 12
           # Information only: the Intel part of the app under Rosetta. It does not change the result.
           run_case x86_64 -x86_64 "PUBLIK_TELEMETRY_SMOKE=1" 20
+          { kill "$LPID"; wait "$LPID"; } 2>/dev/null
           VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' BetterCast.app/Contents/Info.plist)"
           python3 - "$W/out" "$VERSION" <<'PY'
           import json, re, sys
@@ -183,6 +195,7 @@ jobs:
               ok = ok and cond
           for name, arch in (('arm64', 'arm64'), ('x86_64', 'x64')):
               r = rows(name)
+              check(f'{name}: the listener answers a probe', state(name, 'probe') == '501')
               check(f'{name}: process stayed up', state(name, 'state') == 'up')
               check(f'{name}: exactly one request', len(r) == 1)
               if len(r) == 1:
@@ -194,8 +207,10 @@ jobs:
                         and b.get('app_version') == version and b.get('os') == 'macos' and b.get('arch') == arch)
                   check(f'{name}: install_id is a UUID v4', bool(re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', b.get('install_id', ''))))
                   check(f'{name}: no Origin, no Authorization', not r[0]['has_origin'] and not r[0]['has_authorization'])
+          check('optout: the listener answers a probe', state('optout', 'probe') == '501')
           check('optout: process stayed up', state('optout', 'state') == 'up')
           check('optout: no request', len(rows('optout')) == 0)
+          check('optout: the client says it is off', 'off (opt-out)' in state('optout', 'debug'))
           check('optout: no telemetry.json', state('optout', 'idfile') == 'no')
           print('RUNNER TEST: ' + ('PASS' if ok else 'FAIL'))
           print('Intel part under Rosetta (information only): ' + ('PASS' if rosetta_ok else 'FAIL'))
