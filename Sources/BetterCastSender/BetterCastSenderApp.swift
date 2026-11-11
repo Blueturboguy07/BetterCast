@@ -10,6 +10,8 @@ import IOKit.graphics
 struct BetterCastSenderApp: App {
     @NSApplicationDelegateAdaptor(BetterCastAppDelegate.self) private var appDelegate
     @StateObject private var networkClient = NetworkClient()
+    /// publik build: Sign in with publik comes first (PublikGate.swift, Publik.swift).
+    @StateObject private var publikGate = PublikGate.shared
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
     @AppStorage("hasCompletedTour") private var hasCompletedTour = false
 
@@ -22,17 +24,26 @@ struct BetterCastSenderApp: App {
     @State private var showDonatePrompt: Bool
 
     init() {
+        // publik build: PUBLIK_SELF_TEST=1 prints the publik self-test line and exits here,
+        // before any window opens. See PUBLIK-BUILD.md.
+        PublikGate.selfTestIfAsked()
         _showDonatePrompt = State(initialValue: DonatePromptState.shouldPresentOnLaunch())
-        // publik build: usage counts (app opened, active session). No content is sent.
-        // DO_NOT_TRACK=1 turns it off. See PUBLIK-BUILD.md.
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-        PublikTelemetry.start(appSlug: "bettercast", appVersion: version)
+        // publik build: Sign in with publik starts before any window opens. The window shows it
+        // first; "Welcome to BetterCast" and the main window come after the sign-in. The same
+        // module then sends the usage counts (app opened, active session). No content is sent.
+        // DO_NOT_TRACK=1 turns the usage counts off. See PUBLIK-BUILD.md.
+        PublikGate.shared.start()
     }
 
     var body: some Scene {
         WindowGroup {
             Group {
-                if hasCompletedOnboarding {
+                if !publikGate.signedIn {
+                    // publik build: the gate comes before the permissions wizard and the main window.
+                    PublikGateView(model: publikGate.model)
+                        .frame(minWidth: 520, minHeight: 440)
+                        .background(Color(nsColor: .windowBackgroundColor))
+                } else if hasCompletedOnboarding {
                     mainView
                         .sheet(isPresented: $showDonatePrompt) {
                             DonatePromptView(

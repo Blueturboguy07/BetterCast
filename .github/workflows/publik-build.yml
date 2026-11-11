@@ -1,6 +1,8 @@
 name: publik build
 
-# publik fork (see PUBLIK-BUILD.md). Compiles the Mac app with usage telemetry v1.
+# publik fork (see PUBLIK-BUILD.md). Compiles the Mac app with the publik module: Sign in with
+# publik first, then usage counts. The repository secret PUBLIK_APP_TOKEN goes into Info.plist
+# (scripts/publik-app-token.sh); no step prints it.
 # It does not sign, it does not notarize and it does not publish. The app is signed and
 # notarized later on a Mac that holds the publik Developer ID. Tags do not start this workflow.
 
@@ -65,6 +67,9 @@ jobs:
         run: swift build -c release --arch arm64 --arch x86_64
 
       - name: Assemble BetterCast.app (same layout as make_app.sh, no signing)
+        id: assemble
+        env:
+          PUBLIK_APP_TOKEN: ${{ secrets.PUBLIK_APP_TOKEN }}
         run: |
           set -euo pipefail
           if [ -f ".build/apple/Products/Release/BetterCastSender" ]; then
@@ -81,6 +86,11 @@ jobs:
           mkdir -p "$APP_NAME/Contents/MacOS" "$APP_NAME/Contents/Resources" "$APP_NAME/Contents/Frameworks"
           cp "$BUILD_DIR/BetterCastSender" "$APP_NAME/Contents/MacOS/BetterCastSender"
           cp "BetterCastSender-Info.plist" "$APP_NAME/Contents/Info.plist"
+          if [ -z "${PUBLIK_APP_TOKEN:-}" ]; then
+            echo "::error::The repository secret PUBLIK_APP_TOKEN is not set: this build cannot sign in with publik."
+            exit 1
+          fi
+          ./scripts/publik-app-token.sh "$APP_NAME/Contents/Info.plist"
           cp "assets/branding/BetterCastIcon.icns" "$APP_NAME/Contents/Resources/AppIcon.icns"
           if [ ! -d "$BUILD_DIR/Sparkle.framework" ]; then
             echo "error: Sparkle.framework missing from $BUILD_DIR" >&2
@@ -105,11 +115,26 @@ jobs:
           echo "bundle id: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' BetterCast.app/Contents/Info.plist)"
           otool -L "$BIN" | grep -i sparkle
           echo "Sparkle: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' BetterCast.app/Contents/Frameworks/Sparkle.framework/Versions/B/Resources/Info.plist)"
-          echo "telemetry endpoint strings in the binary: $(strings -a "$BIN" | grep -c 'publikhq.com/api/v1/telemetry')"
+          # The publik module in the binary. (Swift keeps strings of 15 bytes or less inside the code,
+          # so "/api/v1/wallet" and "app_opened" are not in the strings output.)
+          for s in 'https://publikhq.com' '/api/v1/installs' '/api/v1/telemetry' 'Sign in with publik' 'publik self-test: ok'; do
+            echo "string '$s' in the binary: $(strings -a "$BIN" | grep -c -F "$s")"
+          done
+          echo "old telemetry v1 client in the binary: $(strings -a "$BIN" | grep -c -F 'PublikTelemetry')"
+          echo "PublikAppToken key in Info.plist: $(/usr/libexec/PlistBuddy -c 'Print :PublikAppToken' BetterCast.app/Contents/Info.plist >/dev/null 2>&1 && echo present || echo absent)"
           find BetterCast.app -type f | wc -l
 
-      - name: Runner test (app_opened reaches a local listener)
-        continue-on-error: true
+      # The built-app proof of publikhq.com/skills/setup.md step 6, and the gate on this runner.
+      # An ad hoc signed copy of the app runs against a fake publik on 127.0.0.1 (PUBLIK_ORIGIN).
+      # Nothing here talks to publikhq.com. The fake publik never stores the app token: it keeps
+      # only "the installs call carried an app token: yes or no".
+      #   selftest_arm64, selftest_x86_64  PUBLIK_SELF_TEST=1: one line "publik self-test: ok bettercast <version>", exit 0
+      #   signedin    the wallet says claimed: the gate lets the app through, one app_opened with the install key
+      #   anonymous   the wallet says anonymous: the app stays at the gate, polls GET /wallet, sends no usage count
+      #   optout      claimed and DO_NOT_TRACK=1: the gate works, no usage count, no telemetry.json
+      #   x86_64      the signedin case for the Intel part under Rosetta (information only)
+      - name: Runner test (Sign in with publik and usage counts against a fake publik)
+        id: runner
         run: |
           set +e
           set -uo pipefail
@@ -117,119 +142,227 @@ jobs:
           # Test an ad hoc signed copy. The artifact stays as built.
           ditto BetterCast.app "$W/BetterCast.app"
           codesign --force --deep -s - "$W/BetterCast.app" >/dev/null 2>&1 || true
-          cat > "$W/listener.py" <<'PY'
-          import http.server, json, socketserver, sys, urllib.parse
+          cat > "$W/fake-publik.py" <<'PY'
+          import http.server, json, re, socketserver, sys, threading
           out = sys.argv[1]
-          class Server(http.server.HTTPServer):
+          KEY = "pk_live_runnertest_00000000000000000000000000000000"  # a fake key of this fake publik
+          LOCK = threading.Lock()
+          class Server(http.server.ThreadingHTTPServer):
+              daemon_threads = True
               def server_bind(self):  # no reverse lookup of the host name: it can take many seconds
                   socketserver.TCPServer.server_bind(self)
                   self.server_name, self.server_port = self.server_address[:2]
           class H(http.server.BaseHTTPRequestHandler):
-              def do_POST(self):
+              def handle_one(self, method):
                   n = int(self.headers.get('Content-Length') or 0)
-                  body = self.rfile.read(n).decode('utf-8', 'replace')
-                  url = urllib.parse.urlsplit(self.path)
-                  case = (urllib.parse.parse_qs(url.query).get('case') or ['none'])[0]
-                  case = ''.join(c for c in case if c.isalnum() or c == '_') or 'none'
-                  heads = {k.lower() for k in self.headers.keys()}
-                  with open(f'{out}/{case}.jsonl', 'a') as f:
-                      f.write(json.dumps({'path': url.path, 'content_type': self.headers.get('Content-Type'),
-                                          'has_authorization': 'authorization' in heads, 'has_origin': 'origin' in heads,
-                                          'body': body}) + '\n')
-                  self.send_response(204)
-                  self.end_headers()
+                  raw = self.rfile.read(n).decode('utf-8', 'replace') if n else ''
+                  m = re.match(r'^/c/([A-Za-z0-9_]+)(/.*)$', self.path)
+                  case, path = (m.group(1), m.group(2)) if m else ('none', self.path)
+                  origin = f'http://127.0.0.1:{self.server.server_port}/c/{case}'
+                  auth = self.headers.get('Authorization')
+                  row = {'method': method, 'path': path, 'content_type': self.headers.get('Content-Type'),
+                         'has_authorization': auth is not None, 'install_key': auth == f'Bearer {KEY}',
+                         'has_origin': 'Origin' in self.headers}
+                  try:
+                      body = json.loads(raw) if raw else None
+                  except ValueError:
+                      body = None
+                      row['body_not_json'] = True
+                  if isinstance(body, dict) and 'app_token' in body:
+                      row['app_token_present'] = str(body.pop('app_token') or '').startswith('pat_')  # never stored
+                  row['body'] = body
+                  with LOCK, open(f'{out}/{case}.jsonl', 'a') as f:
+                      f.write(json.dumps(row) + '\n')
+                  def send(status, data=None):
+                      payload = json.dumps(data).encode() if data is not None else b''
+                      self.send_response(status)
+                      if data is not None:
+                          self.send_header('Content-Type', 'application/json')
+                      self.send_header('Content-Length', str(len(payload)))
+                      self.end_headers()
+                      self.wfile.write(payload)
+                  if method == 'POST' and path == '/api/v1/installs':
+                      iid = body.get('install_id') if isinstance(body, dict) else None
+                      return send(201, {'key': KEY, 'install_id': iid, 'base_url': f'{origin}/api/v1',
+                                        'claim_url': f'{origin}/claim/ci', 'claim_state': 'anonymous'})
+                  if method == 'GET' and path == '/api/v1/wallet':
+                      if auth != f'Bearer {KEY}':
+                          return send(401, {'error': {'type': 'invalid_key', 'message': 'unknown key'}})
+                      claimed = not case.startswith('anonymous')
+                      return send(200, {'claim_state': 'claimed' if claimed else 'anonymous',
+                                        'claim_url': None if claimed else f'{origin}/claim/ci',
+                                        'account': {'handle': 'ci'} if claimed else None,
+                                        'plan': {'kind': 'none'}, 'balance_micros': 0,
+                                        'top_up_url': f'{origin}/wallet', 'linked_at': None})
+                  if method == 'POST' and path == '/api/v1/telemetry':
+                      return send(204)
+                  if path == '/probe':
+                      return send(204)
+                  return send(404, {'error': {'type': 'not_found'}})
+              def do_GET(self):
+                  self.handle_one('GET')
+              def do_POST(self):
+                  self.handle_one('POST')
               def log_message(self, *a):
                   pass
           s = Server(('127.0.0.1', 0), H)
           print(s.server_address[1], flush=True)
           s.serve_forever()
           PY
-          # One listener for all cases, on a port that the system selects.
-          python3 "$W/listener.py" "$W/out" > "$W/port.txt" 2> "$W/listener.err" &
+          # One fake publik for all cases; each case has its own path prefix /c/<case>.
+          python3 -I "$W/fake-publik.py" "$W/out" > "$W/port.txt" 2> "$W/fake-publik.err" &
           LPID=$!
           for _ in $(seq 1 120); do [ -s "$W/port.txt" ] && break; sleep 0.5; done
           PORT="$(head -1 "$W/port.txt")"
-          echo "listener port: '$PORT'"
-          run_case() { # name, arch flag, extra env assignment, seconds
-            local name="$1" archflag="$2" extra="$3" secs="$4"
+          echo "fake publik port: '$PORT'"
+          APPBIN="$W/BetterCast.app/Contents/MacOS/BetterCastSender"
+          start_case() { # name, arch flag, extra env assignments; starts the app in the background (APID)
+            local name="$1" archflag="$2" extra="$3"
             : > "$W/out/$name.jsonl"
-            local probe; probe="$(arch "$archflag" /usr/bin/curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$PORT/probe")"
+            local probe; probe="$(arch "$archflag" /usr/bin/curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$PORT/c/$name/probe")"
             echo "$probe" > "$W/out/$name.probe"
-            echo "$name: probe from this architecture: HTTP $probe (501 = the listener answers)"
+            echo "$name: probe from this architecture: HTTP $probe (204 = the fake publik answers)"
+            : > "$W/out/$name.jsonl"
             local home="$W/home-$name"; mkdir -p "$home"
-            env HOME="$home" CFFIXED_USER_HOME="$home" $extra \
-              PUBLIK_TELEMETRY_URL="http://127.0.0.1:$PORT/api/v1/telemetry?case=$name" PUBLIK_TELEMETRY_DEBUG=1 \
-              arch "$archflag" "$W/BetterCast.app/Contents/MacOS/BetterCastSender" -SUEnableAutomaticChecks NO \
+            echo "$home" > "$W/out/$name.home"
+            env -u PUBLIK_APP_TOKEN -u PUBLIK_API_KEY -u PUBLIK_TELEMETRY_URL HOME="$home" CFFIXED_USER_HOME="$home" $extra \
+              PUBLIK_ORIGIN="http://127.0.0.1:$PORT/c/$name" PUBLIK_TELEMETRY_DEBUG=1 \
+              arch "$archflag" "$APPBIN" -SUEnableAutomaticChecks NO \
               > "$W/out/$name.stdout.txt" 2> "$W/out/$name.stderr.txt" &
-            local apid=$!
-            sleep "$secs"
-            if kill -0 "$apid" 2>/dev/null; then echo "$name: process is up after $secs s"; echo up > "$W/out/$name.state"; else echo "$name: process ended early"; echo ended > "$W/out/$name.state"; fi
-            { kill "$apid"; sleep 1; kill -9 "$apid"; wait "$apid"; } 2>/dev/null
-            grep -h "publik-telemetry" "$W/out/$name.stderr.txt" > "$W/out/$name.debug"
-            cat "$W/out/$name.debug"
-            echo "$name: requests = $(grep -c . "$W/out/$name.jsonl")"
-            [ -f "$home/Library/Application Support/publik/telemetry.json" ] && echo yes > "$W/out/$name.idfile" || echo no > "$W/out/$name.idfile"
+            APID=$!
           }
-          run_case arm64 -arm64 "PUBLIK_TELEMETRY_SMOKE=1" 12
+          finish_case() { # name; reads the files the app left
+            local name="$1" home; home="$(cat "$W/out/$name.home")"
+            local pdir="$home/Library/Application Support/publik"
+            grep -h "publik-telemetry" "$W/out/$name.stderr.txt" > "$W/out/$name.debug"
+            sed 's/^/      debug: /' "$W/out/$name.debug"
+            echo "$name: requests = $(grep -c . "$W/out/$name.jsonl")"
+            [ -f "$pdir/telemetry.json" ] && echo yes > "$W/out/$name.idfile" || echo no > "$W/out/$name.idfile"
+            if [ -f "$pdir/apps/bettercast.json" ]; then stat -f '%Lp' "$pdir/apps/bettercast.json" > "$W/out/$name.credmode"; else echo none > "$W/out/$name.credmode"; fi
+          }
+          run_case() { # name, arch flag, extra env, seconds: the app must still run at the end
+            local name="$1" secs="$4"
+            start_case "$1" "$2" "$3"
+            sleep "$secs"
+            if kill -0 "$APID" 2>/dev/null; then echo "$name: process is up after $secs s"; echo up > "$W/out/$name.state"; else echo "$name: process ended early"; echo ended > "$W/out/$name.state"; fi
+            { kill "$APID"; sleep 1; kill -9 "$APID"; wait "$APID"; } 2>/dev/null
+            finish_case "$name"
+          }
+          self_test() { # name, arch flag: the app must print its line and exit by itself
+            local name="$1"
+            start_case "$1" "$2" "PUBLIK_SELF_TEST=1"
+            local i code="timeout"
+            for i in $(seq 1 120); do kill -0 "$APID" 2>/dev/null || break; sleep 0.5; done
+            if kill -0 "$APID" 2>/dev/null; then { kill -9 "$APID"; wait "$APID"; } 2>/dev/null; else wait "$APID"; code="$?"; fi
+            echo "$code" > "$W/out/$name.exit"
+            echo "$name: exit code $code; stdout: $(grep -a 'publik self-test' "$W/out/$name.stdout.txt" | sed 's/pat_[A-Za-z0-9_]*/pat_(hidden)/g')"
+            finish_case "$name"
+          }
+          self_test selftest_arm64 -arm64
+          self_test selftest_x86_64 -x86_64
+          run_case signedin -arm64 "" 12
+          run_case anonymous -arm64 "" 12
           run_case optout -arm64 "DO_NOT_TRACK=1" 12
           # Information only: the Intel part of the app under Rosetta. It does not change the result.
-          run_case x86_64 -x86_64 "PUBLIK_TELEMETRY_SMOKE=1" 20
+          run_case x86_64 -x86_64 "" 20
           { kill "$LPID"; wait "$LPID"; } 2>/dev/null
           VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' BetterCast.app/Contents/Info.plist)"
-          python3 - "$W/out" "$VERSION" <<'PY'
+          python3 -I - "$W/out" "$VERSION" <<'PY'
           import json, re, sys
           out, version = sys.argv[1], sys.argv[2]
+          WANT = f'publik self-test: ok bettercast {version}'
+          FIELDS = {'v', 'app', 'install_id', 'event', 'app_version', 'os', 'arch'}
+          UUID4 = r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
           def rows(name):
               return [json.loads(l) for l in open(f'{out}/{name}.jsonl') if l.strip()]
           def state(name, ext):
-              return open(f'{out}/{name}.{ext}').read().strip()
+              try:
+                  return open(f'{out}/{name}.{ext}', errors='replace').read().strip()
+              except OSError:
+                  return ''
+          def calls(name, method, path):
+              return [r for r in rows(name) if r['method'] == method and r['path'] == path]
           ok = True
           rosetta_ok = True
           def check(label, cond):
               global ok, rosetta_ok
-              if label.startswith('x86_64'):
+              if label.startswith('x86_64:'):
                   print(('PASS  ' if cond else 'INFO  failed (Rosetta, information only): ') + label)
                   rosetta_ok = rosetta_ok and cond
                   return
               print(('PASS  ' if cond else 'FAIL  ') + label)
               ok = ok and cond
-          for name, arch in (('arm64', 'arm64'), ('x86_64', 'x64')):
-              r = rows(name)
-              check(f'{name}: the listener answers a probe', state(name, 'probe') == '501')
+          lines = {}
+          for name, arch in (('selftest_arm64', 'arm64'), ('selftest_x86_64', 'x64')):
+              got = re.findall(r'publik self-test:[^\r\n]*', state(name, 'stdout.txt'))
+              lines[name] = got
+              inst = calls(name, 'POST', '/api/v1/installs')
+              check(f'{name}: the fake publik answers a probe', state(name, 'probe') == '204')
+              check(f'{name}: the app ended by itself with exit code 0', state(name, 'exit') == '0')
+              check(f'{name}: exactly one line "{WANT}"', got == [WANT])
+              check(f'{name}: one POST /api/v1/installs with the app token of this build', len(inst) == 1 and inst[0].get('app_token_present') is True)
+              if inst:
+                  b = inst[0]['body'] or {}
+                  check(f'{name}: installs body (slug, version, os, arch)', b.get('app_slug') == 'bettercast' and b.get('app_version') == version
+                        and b.get('os') == 'macos' and b.get('arch') == arch)
+              check(f'{name}: GET /api/v1/wallet with the install key', any(r['install_key'] for r in calls(name, 'GET', '/api/v1/wallet')))
+              check(f'{name}: no usage count in self-test mode', len(calls(name, 'POST', '/api/v1/telemetry')) == 0)
+              check(f'{name}: credential file is mode 600', state(name, 'credmode') == '600')
+          for name, arch in (('signedin', 'arm64'), ('x86_64', 'x64')):
+              t = calls(name, 'POST', '/api/v1/telemetry')
+              check(f'{name}: the fake publik answers a probe', state(name, 'probe') == '204')
               check(f'{name}: process stayed up', state(name, 'state') == 'up')
-              check(f'{name}: exactly one request', len(r) == 1)
-              if len(r) == 1:
-                  b = json.loads(r[0]['body'])
+              check(f'{name}: one POST /api/v1/installs with the app token', len(calls(name, 'POST', '/api/v1/installs')) == 1
+                    and all(r.get('app_token_present') for r in calls(name, 'POST', '/api/v1/installs')))
+              check(f'{name}: GET /api/v1/wallet with the install key', len(calls(name, 'GET', '/api/v1/wallet')) >= 1
+                    and all(r['install_key'] for r in calls(name, 'GET', '/api/v1/wallet')))
+              check(f'{name}: exactly one usage count after the gate', len(t) == 1)
+              if len(t) == 1:
+                  b = t[0]['body'] or {}
                   print('      body:', json.dumps(b, sort_keys=True))
-                  check(f'{name}: path', r[0]['path'] == '/api/v1/telemetry')
-                  check(f'{name}: fields', set(b) == {'v', 'app', 'install_id', 'event', 'app_version', 'os', 'arch'})
+                  check(f'{name}: fields', set(b) == FIELDS)
                   check(f'{name}: values', b.get('v') == 1 and b.get('app') == 'bettercast' and b.get('event') == 'app_opened'
                         and b.get('app_version') == version and b.get('os') == 'macos' and b.get('arch') == arch)
-                  check(f'{name}: install_id is a UUID v4', bool(re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', b.get('install_id', ''))))
-                  check(f'{name}: no Origin, no Authorization', not r[0]['has_origin'] and not r[0]['has_authorization'])
-          check('optout: the listener answers a probe', state('optout', 'probe') == '501')
+                  check(f'{name}: install_id is a UUID v4', bool(re.match(UUID4, b.get('install_id', ''))))
+                  check(f'{name}: Authorization is the install key, no Origin', t[0]['install_key'] and not t[0]['has_origin'])
+              check(f'{name}: telemetry.json is there', state(name, 'idfile') == 'yes')
+              check(f'{name}: credential file is mode 600', state(name, 'credmode') == '600')
+          w = calls('anonymous', 'GET', '/api/v1/wallet')
+          check('anonymous: the fake publik answers a probe', state('anonymous', 'probe') == '204')
+          check('anonymous: process stayed up (it waits at Sign in with publik)', state('anonymous', 'state') == 'up')
+          check('anonymous: one POST /api/v1/installs', len(calls('anonymous', 'POST', '/api/v1/installs')) == 1)
+          check(f'anonymous: the gate polls GET /api/v1/wallet ({len(w)} calls in 12 s, want 3 or more)', len(w) >= 3)
+          check('anonymous: no usage count before the sign-in', len(calls('anonymous', 'POST', '/api/v1/telemetry')) == 0)
+          check('optout: the fake publik answers a probe', state('optout', 'probe') == '204')
           check('optout: process stayed up', state('optout', 'state') == 'up')
-          check('optout: no request', len(rows('optout')) == 0)
-          check('optout: the client says it is off', 'off (opt-out)' in state('optout', 'debug'))
+          check('optout: the gate still asks GET /api/v1/wallet', len(calls('optout', 'GET', '/api/v1/wallet')) >= 1)
+          check('optout: no usage count', len(calls('optout', 'POST', '/api/v1/telemetry')) == 0)
+          check('optout: the module says it is off', 'off (opt-out)' in state('optout', 'debug'))
           check('optout: no telemetry.json', state('optout', 'idfile') == 'no')
+          for name in ('selftest_arm64', 'selftest_x86_64'):
+              if lines[name] == [WANT]:
+                  print(f'{name}: {WANT}')
           print('RUNNER TEST: ' + ('PASS' if ok else 'FAIL'))
-          print('Intel part under Rosetta (information only): ' + ('PASS' if rosetta_ok else 'FAIL'))
+          print('Intel part under Rosetta, usage count (information only): ' + ('PASS' if rosetta_ok else 'FAIL'))
           json.dump({'result': 'PASS' if ok else 'FAIL', 'rosetta_x86_64_info': 'PASS' if rosetta_ok else 'FAIL', 'version': version,
-                     'arm64': rows('arm64'), 'x86_64': rows('x86_64'), 'optout': rows('optout')},
-                    open(f'{out}/runner-telemetry.json', 'w'), indent=1)
+                     'self_test_lines': lines,
+                     'cases': {n: rows(n) for n in ('selftest_arm64', 'selftest_x86_64', 'signedin', 'anonymous', 'optout', 'x86_64')}},
+                    open(f'{out}/runner-test.json', 'w'), indent=1)
           sys.exit(0 if ok else 1)
           PY
 
       - name: Pack the app (ditto keeps the symlinks)
+        if: always() && steps.assemble.outcome == 'success'
         run: |
           set -euo pipefail
           mkdir -p dist
           ditto -c -k --keepParent BetterCast.app dist/BetterCast-unsigned.app.zip
-          cp "$RUNNER_TEMP/smoke/out/runner-telemetry.json" dist/ 2>/dev/null || echo '{"result":"NOT RUN"}' > dist/runner-telemetry.json
+          cp "$RUNNER_TEMP/smoke/out/runner-test.json" dist/ 2>/dev/null || echo '{"result":"NOT RUN"}' > dist/runner-test.json
           shasum -a 256 dist/BetterCast-unsigned.app.zip
           ls -la dist
 
       - name: Upload
+        if: always() && steps.assemble.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: BetterCast-macos-universal-unsigned

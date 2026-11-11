@@ -25,6 +25,8 @@ Please do **not** open a public GitHub issue for security vulnerabilities.
 BetterCast streams display content directly between your own devices over
 your local network (Wi-Fi or USB-C). It does not use relay servers, cloud
 services, accounts, or telemetry, and it does not collect personal data.
+(The publik build of this fork is different: it opens with Sign in with publik
+and sends usage counts to publik. See PUBLIK-BUILD.md.)
 Reports most relevant to this project include, for example:
 
 - Flaws in the peer-to-peer streaming or device-discovery protocol

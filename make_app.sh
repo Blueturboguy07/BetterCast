@@ -45,6 +45,8 @@ mkdir -p "$APP_NAME/Contents/Resources"
 # Binary is still named BetterCastSender from the Swift package target
 cp "$BUILD_DIR/BetterCastSender" "$APP_NAME/Contents/MacOS/BetterCastSender"
 cp "BetterCastSender-Info.plist" "$APP_NAME/Contents/Info.plist"
+# publik build: the publik app token (PUBLIK_APP_TOKEN) goes into Info.plist for Sign in with publik.
+./scripts/publik-app-token.sh "$APP_NAME/Contents/Info.plist"
 cp "assets/branding/BetterCastIcon.icns" "$APP_NAME/Contents/Resources/AppIcon.icns"
 
 # Sparkle (in-app updates). SwiftPM links it as @rpath/Sparkle.framework but only
