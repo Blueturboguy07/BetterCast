@@ -123,13 +123,14 @@ BetterCast is free and open source. If you find it useful and want to support de
 
 **[Donate on Whop](https://whop.com/bettercast/bettercast-donate/)**
 
-## Usage counts (publik build)
+## Sign in with publik and usage counts (publik build)
 
 This fork is the publik build of BetterCast. It is not the build of the author. See [PUBLIK-BUILD.md](PUBLIK-BUILD.md).
 
-- The Mac app of this build sends two usage events to publik: `app_opened` (one for each launch) and `active_session` (every 30 minutes while the app runs).
-- Each event holds the app name, the app version, the operating system, the CPU type and a random install ID. It holds nothing else: no screen content, no sound, no device names, no network names.
-- To turn it off, set `DO_NOT_TRACK=1` in the environment of the app (for example `launchctl setenv DO_NOT_TRACK 1`, then start the app again), or put `{"usage": false}` in `~/Library/Application Support/publik/consent.json`.
+- The Mac app of this build opens with "Sign in with publik". You need a publik account: the sign-in page opens in your browser, and the app continues when you are signed in. Then "Welcome to BetterCast" and the permissions come. The table at the top ("No account needed") is about the build of the author.
+- To sign in, the app registers this Mac with publik one time. That request holds the app name and version, the operating system, the CPU type, a random install ID and the name of this Mac.
+- After the sign-in, the app sends two usage events to publik: `app_opened` (one for each launch) and `active_session` (every 30 minutes while the app runs). Each event holds the app name, the app version, the operating system, the CPU type and a random install ID, with the install key of this Mac. It holds nothing else: no screen content, no sound, no device names, no network names.
+- To turn the usage events off, set `DO_NOT_TRACK=1` or `PUBLIK_TELEMETRY=0` in the environment of the app (for example `launchctl setenv DO_NOT_TRACK 1`, then start the app again), or put `{"usage": false}` in `~/Library/Application Support/publik/consent.json`. The sign-in stays.
 - Details: https://publikhq.com/skills/telemetry.md
 
 ## Disclaimer
